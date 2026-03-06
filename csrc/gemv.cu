@@ -136,8 +136,8 @@ __global__ void attention_weighted_sum_kernel(
   }
 }
 
-// cuBLAS handle management
-static cublasHandle_t g_cublas_handle = nullptr;
+// cuBLAS handle management (external linkage — shared with prefill_attention.cu)
+cublasHandle_t g_cublas_handle = nullptr;
 
 extern "C" {
 

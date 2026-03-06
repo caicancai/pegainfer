@@ -161,6 +161,30 @@ unsafe extern "C" {
 
     pub fn cublas_init();
 
+    // Batched prefill attention (QK norm + RoPE + cuBLAS GEMM + causal softmax)
+    pub fn prefill_attention_cuda(
+        q_batch: *mut Half,
+        k_batch: *mut Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        k_cache: *mut Half,
+        v_cache: *mut Half,
+        output: *mut Half,
+        scores_buf: *mut f32,
+        softmax_buf: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        start_pos: i32,
+        scale: f32,
+        rms_eps: f32,
+        stream: CUstream,
+    );
+
     // Fused GQA Attention — prefill variant (scalar pos/seq_len, per-position cos/sin)
     pub fn fused_gqa_attention_single_token(
         q_full: *const Half,

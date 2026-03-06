@@ -285,8 +285,21 @@ impl Qwen3Model {
         kv_cache: &mut KVCache,
     ) -> Result<HiddenStates> {
         let seq_len = hidden.seq_len;
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim;
+        let total_seq = start_pos + seq_len;
+        let q_dim = num_heads * head_dim;
+
+        // Pre-allocate attention scratch buffers (reused across all 36 layers)
+        let mut scratch = ops::PrefillAttnScratch::new(&self.ctx, num_heads, total_seq, seq_len)?;
+        let mut attn_output = HiddenStates::zeros(&self.ctx, q_dim, seq_len)?;
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer_batch(layer_idx, layer, &hidden, start_pos, kv_cache)?;
+            hidden = self.forward_layer_batch(
+                layer_idx, layer, &hidden, start_pos, kv_cache,
+                &mut scratch, &mut attn_output,
+            )?;
         }
 
         // Increment sequence length AFTER all layers processed
@@ -315,11 +328,12 @@ impl Qwen3Model {
         hidden: &HiddenStates,
         start_pos: usize,
         kv_cache: &mut KVCache,
+        scratch: &mut ops::PrefillAttnScratch,
+        attn_output: &mut HiddenStates,
     ) -> Result<HiddenStates> {
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
-        let seq_len = hidden.seq_len;
 
         kv_cache.init_if_needed(&self.ctx, head_dim)?;
 
@@ -332,53 +346,37 @@ impl Qwen3Model {
         )?;
 
         // 2. QKV projection (GEMM — reads each weight matrix once for all tokens)
-        let q_batch = ops::gemm(&self.ctx, &layer.attention.q_proj, &normed)?;
-        let k_batch = ops::gemm(&self.ctx, &layer.attention.k_proj, &normed)?;
+        let mut q_batch = ops::gemm(&self.ctx, &layer.attention.q_proj, &normed)?;
+        let mut k_batch = ops::gemm(&self.ctx, &layer.attention.k_proj, &normed)?;
         let v_batch = ops::gemm(&self.ctx, &layer.attention.v_proj, &normed)?;
 
-        // 3. Attention (per-token loop — attention is <1% of FLOPs for short sequences)
-        let q_dim = num_heads * head_dim;
+        // 3. Batched attention (cuBLAS GEMM replaces per-token loop)
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let mut attn_batch = HiddenStates::zeros(&self.ctx, q_dim, seq_len)?;
+        let (k_cache_layer, v_cache_layer) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
 
-        for i in 0..seq_len {
-            let pos = start_pos + i;
-            let current_seq_len = pos + 1;
-
-            let q_i = ops::extract_vec(&self.ctx, &q_batch, i)?;
-            let k_i = ops::extract_vec(&self.ctx, &k_batch, i)?;
-            let v_i = ops::extract_vec(&self.ctx, &v_batch, i)?;
-
-            let (k_cache_layer, v_cache_layer) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
-
-            let cos_pos = self.cos_cache.view(pos * head_dim, head_dim);
-            let sin_pos = self.sin_cache.view(pos * head_dim, head_dim);
-
-            let attn_out = ops::fused_attention(
-                &self.ctx,
-                &q_i,
-                &k_i,
-                &v_i,
-                &layer.attention.q_norm,
-                &layer.attention.k_norm,
-                &cos_pos,
-                &sin_pos,
-                k_cache_layer,
-                v_cache_layer,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                pos,
-                current_seq_len,
-                scale,
-                self.config.rms_norm_eps,
-            )?;
-
-            ops::write_vec(&self.ctx, &mut attn_batch, i, &attn_out)?;
-        }
+        ops::prefill_attention_batch(
+            &self.ctx,
+            &mut q_batch,
+            &mut k_batch,
+            &v_batch,
+            &layer.attention.q_norm,
+            &layer.attention.k_norm,
+            &self.cos_cache,
+            &self.sin_cache,
+            k_cache_layer,
+            v_cache_layer,
+            scratch,
+            attn_output,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            start_pos,
+            scale,
+            self.config.rms_norm_eps,
+        )?;
 
         // 4. O projection (GEMM)
-        let o_batch = ops::gemm(&self.ctx, &layer.attention.o_proj, &attn_batch)?;
+        let o_batch = ops::gemm(&self.ctx, &layer.attention.o_proj, attn_output)?;
 
         // 5. Residual add
         let hidden = ops::add_batch(&self.ctx, hidden, &o_batch)?;
@@ -687,7 +685,24 @@ impl Qwen3Model {
         let mut tokens = prompt_tokens.to_vec();
         let mut kv_cache = self.take_kv_cache();
 
-        let next_token = {
+        // Take persistent decode state early (needed for single-token prefill optimization)
+        let mut bufs = self.take_decode_bufs()?;
+        let mut graph_state = self.take_graph_state();
+
+        let next_token = if prompt_tokens.len() == 1 {
+            // Single-token prompt: use decode path (GEMV + fused kernels + CUDA Graph)
+            // Avoids batch GEMM overhead, ~580 temp allocations, and non-fused MLP.
+            let _span = LocalSpan::enter_with_local_parent("prefill_decode")
+                .with_property(|| ("prompt_tokens", "1".to_string()));
+            self.decode_one_token(
+                prompt_tokens[0],
+                &mut kv_cache,
+                &mut bufs,
+                &mut graph_state,
+            )?;
+            self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+        } else {
+            // Multi-token prompt: batch prefill (GEMM)
             let _span = LocalSpan::enter_with_local_parent("prefill")
                 .with_property(|| ("prompt_tokens", prompt_tokens.len().to_string()));
             let start_pos = kv_cache.len();
@@ -707,10 +722,6 @@ impl Qwen3Model {
             ttft.as_secs_f64() * 1000.0,
             prompt_tokens.len()
         );
-
-        // Take persistent decode state from self (avoids borrow conflicts)
-        let mut bufs = self.take_decode_bufs()?;
-        let mut graph_state = self.take_graph_state();
 
         // Generate new tokens using pre-allocated buffers + CUDA Graph
         let tpot_start = Instant::now();
@@ -791,9 +802,23 @@ impl Qwen3Model {
         let mut tokens = prompt_tokens.to_vec();
         let mut kv_cache = self.take_kv_cache();
 
+        // Take persistent decode state early (needed for single-token prefill optimization)
+        let mut bufs = self.take_decode_bufs()?;
+        let mut graph_state = self.take_graph_state();
+
         // Prefill
         let ttft_start = Instant::now();
-        let next_token = {
+        let next_token = if prompt_tokens.len() == 1 {
+            let _span = LocalSpan::enter_with_local_parent("prefill_decode")
+                .with_property(|| ("prompt_tokens", "1".to_string()));
+            self.decode_one_token(
+                prompt_tokens[0],
+                &mut kv_cache,
+                &mut bufs,
+                &mut graph_state,
+            )?;
+            self.select_token(&bufs.logits, params, rng, Some(&mut bufs.sample_probs))?
+        } else {
             let _span = LocalSpan::enter_with_local_parent("prefill")
                 .with_property(|| ("prompt_tokens", prompt_tokens.len().to_string()));
             let start_pos = kv_cache.len();
@@ -813,17 +838,15 @@ impl Qwen3Model {
         tokens.push(next_token);
         let mut emitted_tokens = 1usize;
         if !on_token(next_token) {
+            self.decode_bufs = Some(bufs);
             self.kv_cache = Some(kv_cache);
+            self.graph_state = graph_state;
             return Ok(StreamingStats {
                 emitted_tokens,
                 hit_eos: false,
                 consumer_dropped: true,
             });
         }
-
-        // Take persistent decode state from self
-        let mut bufs = self.take_decode_bufs()?;
-        let mut graph_state = self.take_graph_state();
 
         // Decode using pre-allocated buffers + CUDA Graph
         let tpot_start = Instant::now();

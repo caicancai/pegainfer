@@ -533,6 +533,98 @@ pub fn fused_attention_into(
     Ok(())
 }
 
+/// Batched prefill attention: replaces per-token attention loop with cuBLAS GEMM.
+/// Modifies q_batch and k_batch in-place (QK norm + RoPE).
+#[allow(clippy::too_many_arguments)]
+/// Scratch buffers for prefill attention (reused across layers to avoid per-layer allocation).
+pub struct PrefillAttnScratch {
+    pub scores_fp32: CudaSlice<f32>,
+    pub softmax_bf16: CudaSlice<half::bf16>,
+    pub capacity: usize, // number of elements allocated
+}
+
+impl PrefillAttnScratch {
+    pub fn new(ctx: &DeviceContext, num_q_heads: usize, total_seq: usize, seq_len: usize) -> Result<Self> {
+        let capacity = num_q_heads * total_seq * seq_len;
+        let scores_fp32: CudaSlice<f32> = unsafe {
+            ctx.stream
+                .alloc::<f32>(capacity)
+                .map_err(|e| anyhow!("scores alloc failed: {}", e))?
+        };
+        let softmax_bf16: CudaSlice<half::bf16> = unsafe {
+            ctx.stream
+                .alloc::<half::bf16>(capacity)
+                .map_err(|e| anyhow!("softmax alloc failed: {}", e))?
+        };
+        Ok(Self { scores_fp32, softmax_bf16, capacity })
+    }
+}
+
+pub fn prefill_attention_batch(
+    ctx: &DeviceContext,
+    q_batch: &mut HiddenStates,
+    k_batch: &mut HiddenStates,
+    v_batch: &HiddenStates,
+    q_norm: &DeviceVec,
+    k_norm: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    k_cache: &mut DeviceVec,
+    v_cache: &mut DeviceVec,
+    scratch: &mut PrefillAttnScratch,
+    output: &mut HiddenStates,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    scale: f32,
+    rms_eps: f32,
+) -> Result<()> {
+    let seq_len = q_batch.seq_len;
+
+    {
+        let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
+        let (k_ptr, _gk) = k_batch.data.device_ptr_mut(&ctx.stream);
+        let (v_ptr, _gv) = v_batch.data.device_ptr(&ctx.stream);
+        let (qn_ptr, _gqn) = q_norm.data.device_ptr(&ctx.stream);
+        let (kn_ptr, _gkn) = k_norm.data.device_ptr(&ctx.stream);
+        let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+        let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+        let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
+        let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
+        let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+        let (sc_ptr, _gsc) = scratch.scores_fp32.device_ptr_mut(&ctx.stream);
+        let (sm_ptr, _gsm) = scratch.softmax_bf16.device_ptr_mut(&ctx.stream);
+
+        unsafe {
+            ffi::prefill_attention_cuda(
+                q_ptr as *mut ffi::Half,
+                k_ptr as *mut ffi::Half,
+                v_ptr as *const ffi::Half,
+                qn_ptr as *const ffi::Half,
+                kn_ptr as *const ffi::Half,
+                cos_ptr as *const ffi::Half,
+                sin_ptr as *const ffi::Half,
+                kc_ptr as *mut ffi::Half,
+                vc_ptr as *mut ffi::Half,
+                o_ptr as *mut ffi::Half,
+                sc_ptr as *mut f32,
+                sm_ptr as *mut ffi::Half,
+                num_q_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                seq_len as i32,
+                start_pos as i32,
+                scale,
+                rms_eps,
+                ctx.stream.cu_stream(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Fused GQA Attention (allocating)
 #[allow(clippy::too_many_arguments)]
 pub fn fused_attention(
