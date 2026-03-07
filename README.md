@@ -9,35 +9,30 @@
 </p>
 
 <p align="center">
+  <a href="#supported-models">Models</a> &middot;
   <a href="#quickstart">Quickstart</a> &middot;
-  <a href="#architecture">Architecture</a> &middot;
   <a href="#performance">Performance</a> &middot;
-  <a href="#api">API</a>
+  <a href="#api">API</a> &middot;
+  <a href="#architecture">Architecture</a>
 </p>
 
 ---
 
 ## What is this?
 
-pegainfer is a from-scratch LLM inference engine written in Rust with hand-written CUDA kernels. It currently runs [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) at **~70 tokens/sec** on a single GPU.
+pegainfer is a from-scratch LLM inference engine written in **~7K lines of Rust** and **~3.4K lines of hand-written CUDA kernels**. No PyTorch, no ONNX, no frameworks — just Rust + raw CUDA.
 
-The goal is not to replace vLLM or TensorRT-LLM — it's to understand every layer of the inference stack by building it from the ground up, and to explore what a Rust-native inference engine can look like.
+The goal is to understand every layer of the inference stack by building it from the ground up, and to explore what a Rust-native inference engine can look like.
 
-**What's implemented:**
+## Supported Models
 
-- Full Qwen3 transformer: GQA, RoPE, SwiGLU MLP, RMSNorm
-- 11 custom CUDA kernels + cuBLAS GEMV
-- BF16 storage, FP32 accumulators
-- KV cache with tiled fused attention (online softmax, TILE_SIZE=64)
-- OpenAI-compatible `/v1/completions` HTTP API
-- Safetensors weight loading, HuggingFace tokenizer
+| Model | Architecture | Layers | Params | Status |
+|-------|-------------|--------|--------|--------|
+| [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) | Full attention (GQA) | 36 | 4B | Greedy + sampling |
+| [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | Full attention (GQA) | 36 | 8B | Greedy + sampling |
+| [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Hybrid (24 linear + 8 full attention) | 32 | 4B | Greedy + sampling |
 
-**What's not (yet):**
-
-- Batching, PagedAttention, streaming (SSE)
-- FlashAttention-level kernel optimization
-- Multi-GPU / tensor parallelism
-- Quantization (INT8/INT4)
+Model type is auto-detected from `config.json` — just point `--model-path` at any supported model directory.
 
 ## Quickstart
 
@@ -45,8 +40,16 @@ The goal is not to replace vLLM or TensorRT-LLM — it's to understand every lay
 
 - Rust (2024 edition)
 - CUDA Toolkit (nvcc, cuBLAS)
-- A CUDA-capable GPU
-- Qwen3-4B model weights in `models/Qwen3-4B/`
+- A CUDA-capable GPU (SM target auto-detected at build time)
+
+### Download a Model
+
+```bash
+# Pick one (or more):
+huggingface-cli download Qwen/Qwen3-4B --local-dir models/Qwen3-4B
+huggingface-cli download Qwen/Qwen3-8B --local-dir models/Qwen3-8B
+huggingface-cli download Qwen/Qwen3.5-4B --local-dir models/Qwen3.5-4B
+```
 
 ### Build & Run
 
@@ -54,83 +57,159 @@ The goal is not to replace vLLM or TensorRT-LLM — it's to understand every lay
 export CUDA_HOME=/usr/local/cuda
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
-# Build (compiles CUDA kernels via build.rs)
+# Build (compiles CUDA kernels via build.rs, auto-detects GPU SM target)
 cargo build --release
 
-# Run inference server on port 8000
+# Start server (defaults to Qwen3-4B on port 8000)
 cargo run --release
 
-# Disable CUDA Graph capture/replay on decode path
+# Start server with a different model
+cargo run --release -- --model-path models/Qwen3.5-4B
+
+# Disable CUDA Graph (useful for debugging)
 cargo run --release -- --cuda-graph=false
 
-# Run tests
-cargo test --release
+# Enable performance tracing (Chrome Trace JSON → open with Perfetto UI)
+cargo run --release -- --trace-output-path traces/
 ```
 
-### Download Model
+### Try it
 
 ```bash
-# Using huggingface-cli
-huggingface-cli download Qwen/Qwen3-4B --local-dir models/Qwen3-4B
+# Non-streaming
+curl -s http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "The capital of France is", "max_tokens": 32}'
+
+# Streaming (SSE)
+curl -N http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Write a haiku about Rust:", "max_tokens": 64, "stream": true}'
+
+# With sampling parameters
+curl -s http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Once upon a time", "max_tokens": 128, "temperature": 0.7, "top_p": 0.9}'
 ```
+
+### Run Tests
+
+```bash
+# Unit tests (tensor, ops, config, tokenizer, sampler)
+cargo test --release
+
+# E2E greedy regression (Qwen3-4B, needs GPU + model weights)
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+
+# E2E greedy regression (Qwen3.5-4B)
+cargo test --release --test e2e_qwen35
+```
+
+> **Note:** Always use `--release`. Debug builds are extremely slow for GPU/CUDA code and will timeout.
+
+## Performance
+
+Measured on **RTX 5070 Ti** (16 GB), BF16, CUDA Graph enabled:
+
+| Metric | Qwen3-4B | Qwen3.5-4B |
+|--------|----------|-------------|
+| TTFT (short prompt) | ~14 ms | ~22 ms |
+| TPOT (decode) | ~11 ms/tok | ~12.2 ms/tok |
+| Throughput | **~91 tok/s** | **~82 tok/s** |
+
+<details>
+<summary>What do these metrics mean?</summary>
+
+- **TTFT** (Time To First Token): latency from receiving the prompt to generating the first output token. Includes tokenization, embedding, and the full prefill pass.
+- **TPOT** (Time Per Output Token): average time to generate each subsequent token during the decode phase.
+- **Throughput**: 1000 / TPOT, i.e. tokens generated per second during decode.
+
+</details>
+
+Profiling traces can be written to `traces/` in Chrome Trace JSON format — open with [Perfetto UI](https://ui.perfetto.dev).
 
 ## API
 
-OpenAI-compatible completions endpoint:
+OpenAI-compatible `/v1/completions` endpoint.
 
-```bash
-curl http://localhost:8000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "The capital of France is", "max_tokens": 32}'
-```
+**Request fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `prompt` | string | (required) | Input text |
+| `max_tokens` | int | 128 | Maximum tokens to generate |
+| `temperature` | float | 0.0 | Sampling temperature (0 = greedy) |
+| `top_k` | int | 50 | Top-k sampling |
+| `top_p` | float | 1.0 | Nucleus sampling threshold |
+| `stream` | bool | false | Enable SSE streaming |
 
 ## Architecture
 
 ```
-Tokenize → Embedding → 28× TransformerBlock → RMSNorm → LM Head → Argmax
+Tokenize → Embedding → N × TransformerBlock → RMSNorm → LM Head → Sample
                               │
-                              ├── RMSNorm → Fused GQA Attention → Residual
-                              └── RMSNorm → Fused SwiGLU MLP    → Residual
+                              ├── RMSNorm → Attention → Residual
+                              └── RMSNorm → MLP (SwiGLU) → Residual
 ```
+
+- **Prefill**: batched GEMM for all prompt tokens at once
+- **Decode**: single-token GEMV per step, CUDA Graph captured and replayed
+- **BF16 storage**, FP32 accumulators in all kernels
+- **Qwen3**: 32 Q heads, 8 KV heads (GQA 4:1), head_dim=128
+- **Qwen3.5**: hybrid architecture — 24 linear attention layers (Gated Delta Rule) + 8 full attention layers, head_dim=256
+
+### Source Layout
 
 ```
 src/
-├── main.rs           # HTTP server (axum)
-├── model.rs          # Qwen3Model, Attention, MLP, TransformerBlock
-├── tensor.rs         # DeviceVec, DeviceMatrix — GPU tensor types
-├── ops.rs            # GPU operators (linear, rms_norm, rope, fused_mlp, fused_attention)
-├── kv_cache.rs       # KV cache for autoregressive generation
-├── weight_loader.rs  # Safetensors loading + RoPE precomputation
-├── ffi.rs            # FFI bindings to CUDA kernels
-├── qwen3_config.rs   # Model config parsing
-├── tokenizer.rs      # HuggingFace tokenizers wrapper
-└── trace_reporter.rs # Chrome Trace JSON profiling output
+├── main.rs              # CLI + HTTP server startup (axum)
+├── http_server/         # OpenAI-compatible /v1/completions (streaming + non-streaming)
+├── server_engine.rs     # ServerEngine trait, model type detection, engine loading
+├── model.rs             # Qwen3Model: attention, MLP, forward, generate
+├── qwen35_model.rs      # Qwen3.5Model: hybrid linear + full attention
+├── tensor.rs            # DeviceVec, DeviceMatrix, HiddenStates — GPU tensor types
+├── ops.rs               # GPU operators (linear, rms_norm, rope, fused_mlp, fused_attention, …)
+├── kv_cache.rs          # KV cache for autoregressive generation
+├── recurrent_state.rs   # Recurrent state for linear attention (Qwen3.5)
+├── weight_loader.rs     # Safetensors loading + RoPE precomputation
+├── ffi.rs               # FFI bindings to CUDA kernels
+├── qwen3_config.rs      # Qwen3 config parsing
+├── qwen35_config.rs     # Qwen3.5 config parsing (mixed layer types)
+├── tokenizer.rs         # HuggingFace tokenizers wrapper
+├── sampler.rs           # Temperature, top-k, top-p sampling
+└── trace_reporter.rs    # Chrome Trace JSON profiling output
 
 csrc/
-├── kernels.cu          # RMSNorm, RoPE, SiLU, embedding, GEMV, fused MLP, sampling
-├── fused_attention.cu  # Fused GQA attention with tiled online softmax
-└── common.cuh          # Shared CUDA utilities
+├── embedding.cu             # Token embedding lookup
+├── norm.cu                  # RMSNorm (+ fused Add+RMSNorm)
+├── pos_enc.cu               # RoPE
+├── gemv.cu                  # GEMV (BF16×2 vectorized)
+├── fused_attention.cu       # Fused GQA attention, tiled online softmax (head_dim=128)
+├── fused_attention_hd256.cu # Fused attention for head_dim=256 (Qwen3.5)
+├── prefill_attention.cu     # Batched prefill attention
+├── fused_mlp.cu             # Fused SwiGLU MLP (gate+up→SiLU→down)
+├── activation.cu            # SiLU activation
+├── elementwise.cu           # Add, copy, softmax
+├── conv1d.cu                # Conv1d for linear attention (Qwen3.5)
+├── gated_delta_rule.cu      # Gated Delta Rule recurrence (Qwen3.5)
+└── sampling.cu              # GPU argmax, top-k/top-p sampling
 ```
 
-### Key design decisions
+### Key Design Decisions
 
 - **All computation on GPU** — no CPU fallback, no hybrid execution
 - **Custom CUDA kernels** for everything except matrix multiplication (cuBLAS)
 - **Fused operators** — attention and MLP are each a single kernel launch
 - **BF16 storage, FP32 accumulation** — numerical stability without memory overhead
-- **Synchronous execution** — simple and debuggable, no overlap optimization yet
+- **CUDA Graph** on decode path — eliminates kernel launch overhead
+- **Synchronous execution** — simple and debuggable, no CPU-GPU overlap yet
 
-## Performance
+### What's not (yet) implemented
 
-Measured on RTX 5070 Ti, Qwen3-4B, BF16:
-
-| Metric | Value |
-|--------|-------|
-| TTFT (prompt_len=4) | ~17 ms |
-| TPOT | ~14 ms/token |
-| Throughput | ~70 tokens/sec |
-
-Profiling traces are written to `traces/` in Chrome Trace JSON format — open with [Perfetto UI](https://ui.perfetto.dev).
+- Batched requests / continuous batching
+- PagedAttention
+- Multi-GPU / tensor parallelism
+- Quantization (INT8/INT4)
 
 ## License
 
