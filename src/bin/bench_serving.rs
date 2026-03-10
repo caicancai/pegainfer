@@ -1,0 +1,1019 @@
+//! In-process inference benchmark CLI.
+//!
+//! Usage:
+//!   cargo run -r --bin bench_serving -- [GLOBAL_OPTIONS] <SUBCOMMAND> [OPTIONS]
+//!
+//! Examples:
+//!   cargo run -r --bin bench_serving -- request --prompt "Tell me a story" --output-len 128
+//!   cargo run -r --bin bench_serving -- request --prompt-len 512 --output-len 64
+//!   cargo run -r --bin bench_serving -- matrix --prompt-lens 32,128,512 --output-lens 32,128
+//!   cargo run -r --bin bench_serving -- curve --prompt-len 1024 --output-len 256 --window 32
+
+use std::fmt::Write as _;
+use std::fs;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, ensure};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use log::info;
+use pegainfer::logging;
+use pegainfer::model::{ModelRuntimeConfig, Qwen3Model};
+use pegainfer::qwen35_model::Qwen35Model;
+use pegainfer::sampler::SamplingParams;
+use pegainfer::server_engine::{ModelType, detect_model_type};
+use pegainfer::tokenizer::Tokenizer;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use serde::Serialize;
+
+const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
+const DEFAULT_REQUEST_PROMPT: &str = "Tell me a story";
+const DEFAULT_CURVE_PROMPT_LEN: usize = 512;
+const SYNTHETIC_PATTERN: &str = "token_id = 100 + (idx % 1000)";
+const TOP_LEVEL_EXAMPLES: &str = "\
+Examples:
+  cargo run -r --bin bench_serving -- request
+  cargo run -r --bin bench_serving -- request --prompt \"Tell me a story about Rust\" --output-len 128
+  cargo run -r --bin bench_serving -- request --prompt-len 512 --output-len 64
+  cargo run -r --bin bench_serving -- matrix --prompt-lens 32,128,512,2048 --output-lens 32,128,256
+  cargo run -r --bin bench_serving -- curve --prompt-len 1024 --output-len 256 --window 32
+  cargo run -r --bin bench_serving -- --format json --out bench.json request --prompt-len 512 --output-len 64";
+const REQUEST_EXAMPLES: &str = "\
+Examples:
+  cargo run -r --bin bench_serving -- request
+  cargo run -r --bin bench_serving -- request --prompt \"Tell me a story about Rust\" --output-len 128
+  cargo run -r --bin bench_serving -- request --prompt-file prompts/story.txt --output-len 128
+  cargo run -r --bin bench_serving -- request --prompt-len 512 --output-len 64 --warmup 3 --iters 10";
+const MATRIX_EXAMPLES: &str = "\
+Examples:
+  cargo run -r --bin bench_serving -- matrix
+  cargo run -r --bin bench_serving -- matrix --prompt-lens 32,128,512,2048 --output-lens 32,128,256
+  cargo run -r --bin bench_serving -- --format json --out matrix.json matrix --prompt-lens 128,512 --output-lens 64,256";
+const CURVE_EXAMPLES: &str = "\
+Examples:
+  cargo run -r --bin bench_serving -- curve
+  cargo run -r --bin bench_serving -- curve --prompt-len 1024 --output-len 256 --window 32
+  cargo run -r --bin bench_serving -- curve --prompt \"Summarize KV cache behavior\" --output-len 128 --window 16";
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Measure one request shape end-to-end.
+    #[command(after_help = REQUEST_EXAMPLES)]
+    Request(RequestArgs),
+    /// Sweep prompt_len x output_len and summarize each cell.
+    #[command(after_help = MATRIX_EXAMPLES)]
+    Matrix(MatrixArgs),
+    /// Measure TPOT as context grows during decode.
+    #[command(after_help = CURVE_EXAMPLES)]
+    Curve(CurveArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "bench_serving",
+    about = "pegainfer in-process inference benchmark",
+    after_help = TOP_LEVEL_EXAMPLES
+)]
+struct Cli {
+    /// Model directory (contains config.json, tokenizer, safetensors)
+    #[arg(long, default_value = DEFAULT_MODEL_PATH)]
+    model_path: String,
+
+    /// Enable CUDA graph on decode path
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    cuda_graph: bool,
+
+    /// Render result to terminal as text or structured JSON
+    #[arg(long, default_value = "text")]
+    format: OutputFormat,
+
+    /// Optional label to tag this benchmark run
+    #[arg(long)]
+    label: Option<String>,
+
+    /// Optional output path for the rendered report
+    #[arg(long)]
+    out: Option<String>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+struct PromptInputArgs {
+    /// Inline prompt text
+    #[arg(long, conflicts_with_all = ["prompt_file", "prompt_len"])]
+    prompt: Option<String>,
+
+    /// Read prompt text from file
+    #[arg(long, conflicts_with_all = ["prompt", "prompt_len"])]
+    prompt_file: Option<String>,
+
+    /// Use a synthetic prompt with exactly this many token ids
+    #[arg(long, conflicts_with_all = ["prompt", "prompt_file"])]
+    prompt_len: Option<usize>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+struct RunArgs {
+    /// Warmup iterations
+    #[arg(long, default_value_t = 5)]
+    warmup: usize,
+
+    /// Measured iterations
+    #[arg(long, default_value_t = 20)]
+    iters: usize,
+
+    /// RNG seed (matters once sampling becomes non-greedy)
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+}
+
+#[derive(Debug, ClapArgs)]
+struct RequestArgs {
+    #[command(flatten)]
+    prompt_input: PromptInputArgs,
+
+    /// Max generated tokens
+    #[arg(long, default_value_t = 64)]
+    output_len: usize,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Debug, ClapArgs)]
+struct MatrixArgs {
+    /// Synthetic prompt lengths to sweep
+    #[arg(long, value_delimiter = ',', default_value = "32,128,512,2048")]
+    prompt_lens: Vec<usize>,
+
+    /// Output lengths to sweep
+    #[arg(long, value_delimiter = ',', default_value = "32,128,256")]
+    output_lens: Vec<usize>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Debug, ClapArgs)]
+struct CurveArgs {
+    #[command(flatten)]
+    prompt_input: PromptInputArgs,
+
+    /// Max generated tokens
+    #[arg(long, default_value_t = 256)]
+    output_len: usize,
+
+    /// Group decode positions into windows of this size
+    #[arg(long, default_value_t = 32)]
+    window: usize,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RunInfo {
+    command: &'static str,
+    model_path: String,
+    model_type: String,
+    cuda_graph: bool,
+    load_ms: f64,
+    label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PromptDescriptor {
+    source: String,
+    prompt_tokens: usize,
+    prompt_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DurationStats {
+    avg_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    max_ms: f64,
+    samples: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CountStats {
+    min: usize,
+    max: usize,
+    avg: f64,
+    samples: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RequestWorkload {
+    prompt: PromptDescriptor,
+    output_len: usize,
+    warmup: usize,
+    iters: usize,
+    seed: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RequestMetrics {
+    ttft_ms: DurationStats,
+    first_decode_step_ms: Option<DurationStats>,
+    steady_tpot_ms: Option<DurationStats>,
+    e2e_ms: DurationStats,
+    generated_tokens: CountStats,
+    request_tok_s: Option<f64>,
+    decode_tok_s: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RequestReport {
+    run: RunInfo,
+    workload: RequestWorkload,
+    metrics: RequestMetrics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MatrixWorkload {
+    prompt_lens: Vec<usize>,
+    output_lens: Vec<usize>,
+    warmup: usize,
+    iters: usize,
+    seed: u64,
+    synthetic_pattern: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MatrixCell {
+    prompt_len: usize,
+    output_len: usize,
+    ttft_ms: DurationStats,
+    e2e_ms: DurationStats,
+    first_decode_step_ms: Option<DurationStats>,
+    steady_tpot_ms: Option<DurationStats>,
+    generated_tokens: CountStats,
+    request_tok_s: Option<f64>,
+    decode_tok_s: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MatrixReport {
+    run: RunInfo,
+    workload: MatrixWorkload,
+    cells: Vec<MatrixCell>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CurveWorkload {
+    prompt: PromptDescriptor,
+    output_len: usize,
+    window: usize,
+    warmup: usize,
+    iters: usize,
+    seed: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CurveWindow {
+    ctx_start: usize,
+    ctx_end: usize,
+    tpot_ms: DurationStats,
+    decode_tok_s: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CurveReport {
+    run: RunInfo,
+    workload: CurveWorkload,
+    windows: Vec<CurveWindow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BenchReport {
+    Request(RequestReport),
+    Matrix(MatrixReport),
+    Curve(CurveReport),
+}
+
+fn dur_ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+fn percentiles(sorted: &[Duration]) -> (Duration, Duration, Duration, Duration, Duration) {
+    assert!(!sorted.is_empty());
+    let n = sorted.len();
+    let sum: Duration = sorted.iter().sum();
+    let avg = sum / n as u32;
+    let p = |pct: f64| sorted[((pct / 100.0) * (n - 1) as f64).round() as usize];
+    (avg, p(50.0), p(95.0), p(99.0), sorted[n - 1])
+}
+
+fn summarize_durations(samples: &[Duration]) -> DurationStats {
+    let mut sorted = samples.to_vec();
+    sorted.sort();
+    let (avg, p50, p95, p99, max) = percentiles(&sorted);
+    DurationStats {
+        avg_ms: dur_ms(avg),
+        p50_ms: dur_ms(p50),
+        p95_ms: dur_ms(p95),
+        p99_ms: dur_ms(p99),
+        max_ms: dur_ms(max),
+        samples: sorted.len(),
+    }
+}
+
+fn summarize_counts(samples: &[usize]) -> CountStats {
+    assert!(!samples.is_empty());
+    let min = *samples.iter().min().unwrap();
+    let max = *samples.iter().max().unwrap();
+    let sum: usize = samples.iter().sum();
+    CountStats {
+        min,
+        max,
+        avg: sum as f64 / samples.len() as f64,
+        samples: samples.len(),
+    }
+}
+
+fn aggregate_tok_s(tokens: usize, total: Duration) -> Option<f64> {
+    if tokens == 0 || total.is_zero() {
+        None
+    } else {
+        Some(tokens as f64 / total.as_secs_f64())
+    }
+}
+
+fn print_duration_stats(buf: &mut String, label: &str, stats: &DurationStats) {
+    let _ = writeln!(
+        buf,
+        "  {label:<24} avg={:8.2}ms  p50={:8.2}ms  p95={:8.2}ms  p99={:8.2}ms  max={:8.2}ms  n={}",
+        stats.avg_ms, stats.p50_ms, stats.p95_ms, stats.p99_ms, stats.max_ms, stats.samples
+    );
+}
+
+fn push_line(buf: &mut String, key: &str, value: impl std::fmt::Display) {
+    let _ = writeln!(buf, "  {key:<16} {value}");
+}
+
+fn truncate_preview(text: &str, limit: usize) -> String {
+    let one_line = text.replace('\n', "\\n");
+    if one_line.chars().count() <= limit {
+        return one_line;
+    }
+    let mut truncated = String::new();
+    for ch in one_line.chars().take(limit) {
+        truncated.push(ch);
+    }
+    truncated.push_str("...");
+    truncated
+}
+
+fn synthetic_prompt_tokens(len: usize) -> Vec<u32> {
+    (0..len).map(|i| ((i % 1000) + 100) as u32).collect()
+}
+
+#[derive(Debug, Clone)]
+struct PromptSpec {
+    descriptor: PromptDescriptor,
+    tokens: Vec<u32>,
+}
+
+fn resolve_prompt_input(
+    args: &PromptInputArgs,
+    tokenizer: &Tokenizer,
+    default_text: Option<&str>,
+    default_prompt_len: Option<usize>,
+) -> Result<PromptSpec> {
+    match (&args.prompt, &args.prompt_file, args.prompt_len) {
+        (Some(prompt), None, None) => Ok(PromptSpec {
+            descriptor: PromptDescriptor {
+                source: "text".to_string(),
+                prompt_tokens: tokenizer.encode(prompt)?.len(),
+                prompt_preview: Some(truncate_preview(prompt, 96)),
+            },
+            tokens: tokenizer.encode(prompt)?,
+        }),
+        (None, Some(path), None) => {
+            let prompt = fs::read_to_string(path)
+                .with_context(|| format!("failed to read prompt file: {path}"))?;
+            let tokens = tokenizer.encode(&prompt)?;
+            Ok(PromptSpec {
+                descriptor: PromptDescriptor {
+                    source: format!("file:{path}"),
+                    prompt_tokens: tokens.len(),
+                    prompt_preview: Some(truncate_preview(&prompt, 96)),
+                },
+                tokens,
+            })
+        }
+        (None, None, Some(prompt_len)) => {
+            ensure!(prompt_len > 0, "--prompt-len must be > 0");
+            Ok(PromptSpec {
+                descriptor: PromptDescriptor {
+                    source: format!("synthetic:{SYNTHETIC_PATTERN}"),
+                    prompt_tokens: prompt_len,
+                    prompt_preview: None,
+                },
+                tokens: synthetic_prompt_tokens(prompt_len),
+            })
+        }
+        (None, None, None) => {
+            if let Some(prompt) = default_text {
+                let tokens = tokenizer.encode(prompt)?;
+                Ok(PromptSpec {
+                    descriptor: PromptDescriptor {
+                        source: "text".to_string(),
+                        prompt_tokens: tokens.len(),
+                        prompt_preview: Some(truncate_preview(prompt, 96)),
+                    },
+                    tokens,
+                })
+            } else if let Some(prompt_len) = default_prompt_len {
+                Ok(PromptSpec {
+                    descriptor: PromptDescriptor {
+                        source: format!("synthetic:{SYNTHETIC_PATTERN}"),
+                        prompt_tokens: prompt_len,
+                        prompt_preview: None,
+                    },
+                    tokens: synthetic_prompt_tokens(prompt_len),
+                })
+            } else {
+                unreachable!("default prompt source must be provided");
+            }
+        }
+        _ => unreachable!("clap enforces prompt input conflicts"),
+    }
+}
+
+struct GenTimings {
+    ttft: Duration,
+    tbt: Vec<Duration>,
+    total: Duration,
+    emitted_tokens: usize,
+}
+
+trait BenchModel {
+    fn timed_generation(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        sampling: &SamplingParams,
+        rng: &mut StdRng,
+    ) -> GenTimings;
+}
+
+fn run_timed<F>(prompt_tokens: &[u32], max_new_tokens: usize, mut generate: F) -> GenTimings
+where
+    F: FnMut(&[u32], usize, &mut dyn FnMut(u32) -> bool) -> Result<()>,
+{
+    let start = Instant::now();
+    let mut first_at: Option<Instant> = None;
+    let mut prev_at: Option<Instant> = None;
+    let mut emitted_tokens = 0usize;
+    let mut tbt = Vec::with_capacity(max_new_tokens.saturating_sub(1));
+
+    generate(prompt_tokens, max_new_tokens, &mut |_tok| {
+        let now = Instant::now();
+        emitted_tokens += 1;
+        if first_at.is_none() {
+            first_at = Some(now);
+        } else if let Some(prev) = prev_at {
+            tbt.push(now - prev);
+        }
+        prev_at = Some(now);
+        true
+    })
+    .expect("generation failed");
+
+    let total = start.elapsed();
+    let ttft = first_at.map_or(total, |t| t - start);
+    GenTimings {
+        ttft,
+        tbt,
+        total,
+        emitted_tokens,
+    }
+}
+
+impl BenchModel for Qwen3Model {
+    fn timed_generation(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        sampling: &SamplingParams,
+        rng: &mut StdRng,
+    ) -> GenTimings {
+        run_timed(prompt_tokens, max_new_tokens, |toks, n, cb| {
+            self.generate_streaming_with_callback(toks, n, sampling, rng, cb)?;
+            Ok(())
+        })
+    }
+}
+
+impl BenchModel for Qwen35Model {
+    fn timed_generation(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        sampling: &SamplingParams,
+        rng: &mut StdRng,
+    ) -> GenTimings {
+        run_timed(prompt_tokens, max_new_tokens, |toks, n, cb| {
+            self.generate_streaming_with_callback(toks, n, sampling, rng, cb)?;
+            Ok(())
+        })
+    }
+}
+
+fn normalize_sizes(values: &[usize], flag: &str) -> Result<Vec<usize>> {
+    ensure!(!values.is_empty(), "{flag} must not be empty");
+    ensure!(values.iter().all(|v| *v > 0), "{flag} values must be > 0");
+    let mut normalized = values.to_vec();
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn validate_run_args(args: &RunArgs) -> Result<()> {
+    ensure!(args.iters > 0, "--iters must be > 0");
+    Ok(())
+}
+
+fn measure_timings(
+    model: &mut dyn BenchModel,
+    prompt_tokens: &[u32],
+    output_len: usize,
+    run: &RunArgs,
+) -> Result<Vec<GenTimings>> {
+    ensure!(output_len > 0, "--output-len must be > 0");
+    validate_run_args(run)?;
+
+    let sampling = SamplingParams::default();
+    let mut rng = StdRng::seed_from_u64(run.seed);
+
+    for _ in 0..run.warmup {
+        model.timed_generation(prompt_tokens, output_len, &sampling, &mut rng);
+    }
+
+    let mut timings = Vec::with_capacity(run.iters);
+    for _ in 0..run.iters {
+        timings.push(model.timed_generation(prompt_tokens, output_len, &sampling, &mut rng));
+    }
+    Ok(timings)
+}
+
+fn build_request_metrics(timings: &[GenTimings]) -> RequestMetrics {
+    let ttfts: Vec<Duration> = timings.iter().map(|t| t.ttft).collect();
+    let e2e: Vec<Duration> = timings.iter().map(|t| t.total).collect();
+    let first_steps: Vec<Duration> = timings
+        .iter()
+        .filter_map(|t| t.tbt.first().copied())
+        .collect();
+    let steady: Vec<Duration> = timings
+        .iter()
+        .flat_map(|t| t.tbt.iter().skip(1).copied())
+        .collect();
+    let generated: Vec<usize> = timings.iter().map(|t| t.emitted_tokens).collect();
+
+    let total_emitted: usize = timings.iter().map(|t| t.emitted_tokens).sum();
+    let total_request_time: Duration = timings.iter().map(|t| t.total).sum();
+    let total_decode_steps: usize = timings
+        .iter()
+        .map(|t| t.emitted_tokens.saturating_sub(1))
+        .sum();
+    let total_decode_time: Duration = timings.iter().flat_map(|t| t.tbt.iter()).copied().sum();
+
+    RequestMetrics {
+        ttft_ms: summarize_durations(&ttfts),
+        first_decode_step_ms: (!first_steps.is_empty()).then(|| summarize_durations(&first_steps)),
+        steady_tpot_ms: (!steady.is_empty()).then(|| summarize_durations(&steady)),
+        e2e_ms: summarize_durations(&e2e),
+        generated_tokens: summarize_counts(&generated),
+        request_tok_s: aggregate_tok_s(total_emitted, total_request_time),
+        decode_tok_s: aggregate_tok_s(total_decode_steps, total_decode_time),
+    }
+}
+
+fn run_info(cli: &Cli, command: &'static str, model_type: ModelType, load_ms: f64) -> RunInfo {
+    RunInfo {
+        command,
+        model_path: cli.model_path.clone(),
+        model_type: format!("{model_type:?}"),
+        cuda_graph: cli.cuda_graph,
+        load_ms,
+        label: cli.label.clone(),
+    }
+}
+
+fn bench_request(
+    model: &mut dyn BenchModel,
+    tokenizer: &Tokenizer,
+    cli: &Cli,
+    model_type: ModelType,
+    load_ms: f64,
+    args: &RequestArgs,
+) -> Result<BenchReport> {
+    let prompt = resolve_prompt_input(
+        &args.prompt_input,
+        tokenizer,
+        Some(DEFAULT_REQUEST_PROMPT),
+        None,
+    )?;
+    info!(
+        "Starting request benchmark: prompt_tokens={} output_len={} warmup={} iters={} seed={}",
+        prompt.descriptor.prompt_tokens,
+        args.output_len,
+        args.run.warmup,
+        args.run.iters,
+        args.run.seed
+    );
+    let timings = measure_timings(model, &prompt.tokens, args.output_len, &args.run)?;
+    Ok(BenchReport::Request(RequestReport {
+        run: run_info(cli, "request", model_type, load_ms),
+        workload: RequestWorkload {
+            prompt: prompt.descriptor,
+            output_len: args.output_len,
+            warmup: args.run.warmup,
+            iters: args.run.iters,
+            seed: args.run.seed,
+        },
+        metrics: build_request_metrics(&timings),
+    }))
+}
+
+fn bench_matrix(
+    model: &mut dyn BenchModel,
+    cli: &Cli,
+    model_type: ModelType,
+    load_ms: f64,
+    args: &MatrixArgs,
+) -> Result<BenchReport> {
+    validate_run_args(&args.run)?;
+    let prompt_lens = normalize_sizes(&args.prompt_lens, "--prompt-lens")?;
+    let output_lens = normalize_sizes(&args.output_lens, "--output-lens")?;
+    info!(
+        "Starting matrix benchmark: prompt_lens={:?} output_lens={:?} warmup={} iters={} seed={}",
+        prompt_lens, output_lens, args.run.warmup, args.run.iters, args.run.seed
+    );
+
+    let mut cells = Vec::with_capacity(prompt_lens.len() * output_lens.len());
+    for &prompt_len in &prompt_lens {
+        let prompt_tokens = synthetic_prompt_tokens(prompt_len);
+        for &output_len in &output_lens {
+            info!(
+                "Running matrix cell: prompt_len={} output_len={}",
+                prompt_len, output_len
+            );
+            let timings = measure_timings(model, &prompt_tokens, output_len, &args.run)?;
+            let metrics = build_request_metrics(&timings);
+            cells.push(MatrixCell {
+                prompt_len,
+                output_len,
+                ttft_ms: metrics.ttft_ms,
+                e2e_ms: metrics.e2e_ms,
+                first_decode_step_ms: metrics.first_decode_step_ms,
+                steady_tpot_ms: metrics.steady_tpot_ms,
+                generated_tokens: metrics.generated_tokens,
+                request_tok_s: metrics.request_tok_s,
+                decode_tok_s: metrics.decode_tok_s,
+            });
+        }
+    }
+
+    Ok(BenchReport::Matrix(MatrixReport {
+        run: run_info(cli, "matrix", model_type, load_ms),
+        workload: MatrixWorkload {
+            prompt_lens,
+            output_lens,
+            warmup: args.run.warmup,
+            iters: args.run.iters,
+            seed: args.run.seed,
+            synthetic_pattern: SYNTHETIC_PATTERN,
+        },
+        cells,
+    }))
+}
+
+fn bench_curve(
+    model: &mut dyn BenchModel,
+    tokenizer: &Tokenizer,
+    cli: &Cli,
+    model_type: ModelType,
+    load_ms: f64,
+    args: &CurveArgs,
+) -> Result<BenchReport> {
+    ensure!(args.window > 0, "--window must be > 0");
+    ensure!(args.output_len >= 2, "--output-len must be >= 2 for curve");
+
+    let prompt = resolve_prompt_input(
+        &args.prompt_input,
+        tokenizer,
+        None,
+        Some(DEFAULT_CURVE_PROMPT_LEN),
+    )?;
+    info!(
+        "Starting curve benchmark: prompt_tokens={} output_len={} window={} warmup={} iters={} seed={}",
+        prompt.descriptor.prompt_tokens,
+        args.output_len,
+        args.window,
+        args.run.warmup,
+        args.run.iters,
+        args.run.seed
+    );
+    let timings = measure_timings(model, &prompt.tokens, args.output_len, &args.run)?;
+
+    let mut tbt_by_pos: Vec<Vec<Duration>> = Vec::new();
+    for timing in &timings {
+        for (idx, &duration) in timing.tbt.iter().enumerate() {
+            if idx >= tbt_by_pos.len() {
+                tbt_by_pos.push(Vec::with_capacity(args.run.iters));
+            }
+            tbt_by_pos[idx].push(duration);
+        }
+    }
+
+    let mut windows = Vec::new();
+    let mut pos = 0usize;
+    while pos < tbt_by_pos.len() {
+        let end = (pos + args.window).min(tbt_by_pos.len());
+        let mut samples = Vec::new();
+        for bucket in &tbt_by_pos[pos..end] {
+            samples.extend_from_slice(bucket);
+        }
+        if !samples.is_empty() {
+            let stats = summarize_durations(&samples);
+            windows.push(CurveWindow {
+                ctx_start: prompt.descriptor.prompt_tokens + pos + 1,
+                ctx_end: prompt.descriptor.prompt_tokens + end,
+                decode_tok_s: (stats.avg_ms > 0.0).then(|| 1000.0 / stats.avg_ms),
+                tpot_ms: stats,
+            });
+        }
+        pos = end;
+    }
+
+    Ok(BenchReport::Curve(CurveReport {
+        run: run_info(cli, "curve", model_type, load_ms),
+        workload: CurveWorkload {
+            prompt: prompt.descriptor,
+            output_len: args.output_len,
+            window: args.window,
+            warmup: args.run.warmup,
+            iters: args.run.iters,
+            seed: args.run.seed,
+        },
+        windows,
+    }))
+}
+
+fn render_text(report: &BenchReport) -> String {
+    let mut out = String::new();
+    match report {
+        BenchReport::Request(report) => {
+            let _ = writeln!(out, "bench_serving request");
+            push_line(
+                &mut out,
+                "model",
+                format!("{} ({})", report.run.model_path, report.run.model_type),
+            );
+            push_line(&mut out, "cuda_graph", report.run.cuda_graph);
+            push_line(&mut out, "load_ms", format!("{:.2}", report.run.load_ms));
+            if let Some(label) = &report.run.label {
+                push_line(&mut out, "label", label);
+            }
+            push_line(&mut out, "prompt_source", &report.workload.prompt.source);
+            push_line(
+                &mut out,
+                "prompt_tokens",
+                report.workload.prompt.prompt_tokens,
+            );
+            if let Some(preview) = &report.workload.prompt.prompt_preview {
+                push_line(&mut out, "prompt_preview", preview);
+            }
+            push_line(&mut out, "output_len", report.workload.output_len);
+            push_line(&mut out, "warmup", report.workload.warmup);
+            push_line(&mut out, "iters", report.workload.iters);
+            push_line(&mut out, "seed", report.workload.seed);
+            let _ = writeln!(out);
+            let _ = writeln!(out, "metrics");
+            print_duration_stats(&mut out, "ttft_ms", &report.metrics.ttft_ms);
+            if let Some(stats) = &report.metrics.first_decode_step_ms {
+                print_duration_stats(&mut out, "first_decode_step_ms", stats);
+            }
+            if let Some(stats) = &report.metrics.steady_tpot_ms {
+                print_duration_stats(&mut out, "steady_tpot_ms", stats);
+            }
+            print_duration_stats(&mut out, "e2e_ms", &report.metrics.e2e_ms);
+            let _ = writeln!(
+                out,
+                "  {:<24} avg={:8.2}  min={:8}  max={:8}  n={}",
+                "generated_tokens",
+                report.metrics.generated_tokens.avg,
+                report.metrics.generated_tokens.min,
+                report.metrics.generated_tokens.max,
+                report.metrics.generated_tokens.samples
+            );
+            if let Some(tok_s) = report.metrics.request_tok_s {
+                let _ = writeln!(out, "  {:<24} {:.2}", "request_tok_s", tok_s);
+            }
+            if let Some(tok_s) = report.metrics.decode_tok_s {
+                let _ = writeln!(out, "  {:<24} {:.2}", "decode_tok_s", tok_s);
+            }
+        }
+        BenchReport::Matrix(report) => {
+            let _ = writeln!(out, "bench_serving matrix");
+            push_line(
+                &mut out,
+                "model",
+                format!("{} ({})", report.run.model_path, report.run.model_type),
+            );
+            push_line(&mut out, "cuda_graph", report.run.cuda_graph);
+            push_line(&mut out, "load_ms", format!("{:.2}", report.run.load_ms));
+            if let Some(label) = &report.run.label {
+                push_line(&mut out, "label", label);
+            }
+            push_line(
+                &mut out,
+                "prompt_lens",
+                report
+                    .workload
+                    .prompt_lens
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            push_line(
+                &mut out,
+                "output_lens",
+                report
+                    .workload
+                    .output_lens
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            push_line(&mut out, "warmup", report.workload.warmup);
+            push_line(&mut out, "iters", report.workload.iters);
+            push_line(&mut out, "seed", report.workload.seed);
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>11}  {:>12}  {:>9}",
+                "prompt_tok",
+                "output_tok",
+                "ttft_avg",
+                "ttft_p95",
+                "e2e_avg",
+                "req_tok/s",
+                "decode_tok/s",
+                "gen_avg"
+            );
+            for cell in &report.cells {
+                let _ = writeln!(
+                    out,
+                    "  {:>10}  {:>10}  {:>10.2}  {:>10.2}  {:>10.2}  {:>11.2}  {:>12.2}  {:>9.2}",
+                    cell.prompt_len,
+                    cell.output_len,
+                    cell.ttft_ms.avg_ms,
+                    cell.ttft_ms.p95_ms,
+                    cell.e2e_ms.avg_ms,
+                    cell.request_tok_s.unwrap_or(0.0),
+                    cell.decode_tok_s.unwrap_or(0.0),
+                    cell.generated_tokens.avg
+                );
+            }
+        }
+        BenchReport::Curve(report) => {
+            let _ = writeln!(out, "bench_serving curve");
+            push_line(
+                &mut out,
+                "model",
+                format!("{} ({})", report.run.model_path, report.run.model_type),
+            );
+            push_line(&mut out, "cuda_graph", report.run.cuda_graph);
+            push_line(&mut out, "load_ms", format!("{:.2}", report.run.load_ms));
+            if let Some(label) = &report.run.label {
+                push_line(&mut out, "label", label);
+            }
+            push_line(&mut out, "prompt_source", &report.workload.prompt.source);
+            push_line(
+                &mut out,
+                "prompt_tokens",
+                report.workload.prompt.prompt_tokens,
+            );
+            if let Some(preview) = &report.workload.prompt.prompt_preview {
+                push_line(&mut out, "prompt_preview", preview);
+            }
+            push_line(&mut out, "output_len", report.workload.output_len);
+            push_line(&mut out, "window", report.workload.window);
+            push_line(&mut out, "warmup", report.workload.warmup);
+            push_line(&mut out, "iters", report.workload.iters);
+            push_line(&mut out, "seed", report.workload.seed);
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "  {:>12}  {:>8}  {:>8}  {:>8}  {:>8}  {:>10}  {:>8}",
+                "ctx_range", "avg_ms", "p50_ms", "p95_ms", "p99_ms", "tok/s", "samples"
+            );
+            for window in &report.windows {
+                let _ = writeln!(
+                    out,
+                    "  {:>5}-{:<6}  {:>8.2}  {:>8.2}  {:>8.2}  {:>8.2}  {:>10.2}  {:>8}",
+                    window.ctx_start,
+                    window.ctx_end,
+                    window.tpot_ms.avg_ms,
+                    window.tpot_ms.p50_ms,
+                    window.tpot_ms.p95_ms,
+                    window.tpot_ms.p99_ms,
+                    window.decode_tok_s.unwrap_or(0.0),
+                    window.tpot_ms.samples
+                );
+            }
+        }
+    }
+    out
+}
+
+fn emit_report(cli: &Cli, report: &BenchReport) -> Result<()> {
+    let rendered = match cli.format {
+        OutputFormat::Text => render_text(report),
+        OutputFormat::Json => serde_json::to_string_pretty(report)?,
+    };
+
+    if let Some(path) = &cli.out {
+        fs::write(path, &rendered).with_context(|| format!("failed to write report to {path}"))?;
+        info!("Wrote benchmark report to {}", path);
+    }
+
+    println!("{rendered}");
+    info!("Benchmark completed");
+    Ok(())
+}
+
+fn run_command(
+    cli: &Cli,
+    model_type: ModelType,
+    load_ms: f64,
+    model: &mut dyn BenchModel,
+    tokenizer: &Tokenizer,
+) -> Result<BenchReport> {
+    match &cli.command {
+        Command::Request(args) => bench_request(model, tokenizer, cli, model_type, load_ms, args),
+        Command::Matrix(args) => bench_matrix(model, cli, model_type, load_ms, args),
+        Command::Curve(args) => bench_curve(model, tokenizer, cli, model_type, load_ms, args),
+    }
+}
+
+fn main() -> Result<()> {
+    logging::init_default();
+
+    let cli = Cli::parse();
+    info!(
+        "bench_serving starting: command={} model_path={} cuda_graph={} format={:?}",
+        match &cli.command {
+            Command::Request(_) => "request",
+            Command::Matrix(_) => "matrix",
+            Command::Curve(_) => "curve",
+        },
+        cli.model_path,
+        cli.cuda_graph,
+        cli.format
+    );
+    let model_type = detect_model_type(&cli.model_path)?;
+    info!("Detected model type: {:?}", model_type);
+    let runtime = ModelRuntimeConfig {
+        enable_cuda_graph: cli.cuda_graph,
+    };
+    let load_start = Instant::now();
+
+    let report = match model_type {
+        ModelType::Qwen3 => {
+            let mut model = Qwen3Model::from_safetensors_with_runtime(&cli.model_path, runtime)?;
+            let tokenizer = Tokenizer::from_file(&cli.model_path)?;
+            let load_ms = dur_ms(load_start.elapsed());
+            run_command(&cli, model_type, load_ms, &mut model, &tokenizer)?
+        }
+        ModelType::Qwen35 => {
+            let mut model = Qwen35Model::from_safetensors_with_options(
+                &cli.model_path,
+                runtime.enable_cuda_graph,
+            )?;
+            let tokenizer = Tokenizer::from_file(&cli.model_path)?;
+            let load_ms = dur_ms(load_start.elapsed());
+            run_command(&cli, model_type, load_ms, &mut model, &tokenizer)?
+        }
+    };
+
+    emit_report(&cli, &report)
+}
