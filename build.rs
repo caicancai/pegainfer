@@ -489,7 +489,11 @@ fn main() {
     compile_triton_aot_kernels(&cuda_path, &out_dir, &sm_targets);
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
+    if cfg!(target_os = "windows") {
+        println!("cargo:rustc-link-search=native={}/lib/x64", cuda_path);
+    } else {
+        println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
+    }
     println!("cargo:rustc-link-lib=static=kernels_cuda");
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
