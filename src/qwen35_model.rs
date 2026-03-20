@@ -12,8 +12,6 @@ use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD
 use log::{debug, info};
 use rand::RngExt;
 use rand::rngs::StdRng;
-use safetensors::SafeTensors;
-use std::fs;
 use std::time::Instant;
 
 use crate::decode_buffers35::DecodeBuffers35;
@@ -133,20 +131,16 @@ impl Qwen35Model {
 
         let (shard_paths, weight_map) = load_shard_info_fixed(model_path)?;
         debug!("Loading {} safetensor shard(s)", shard_paths.len());
-        let shard_data: Vec<Vec<u8>> = shard_paths
+        let mmaps = mmap_shards(&shard_paths)?;
+        let shards: Vec<safetensors::SafeTensors> = mmaps
             .iter()
-            .map(|p| {
-                debug!("Reading shard: {}", p);
-                fs::read(p)
-            })
-            .collect::<std::io::Result<_>>()?;
-        let shards: Vec<SafeTensors> = shard_data
-            .iter()
-            .map(|d| {
-                SafeTensors::deserialize(d).map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))
+            .map(|m| {
+                safetensors::SafeTensors::deserialize(m)
+                    .map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))
             })
             .collect::<Result<_>>()?;
 
+        let t_gpu = Instant::now();
         // Weight prefix for Qwen3.5 text model
         let wp = "model.language_model";
 
@@ -329,6 +323,10 @@ impl Qwen35Model {
             precompute_rope(&ctx, config.rotary_dim, 4096, config.rope_theta)?;
 
         ctx.sync()?;
+        info!(
+            "GPU transfer complete in {:.0}ms",
+            t_gpu.elapsed().as_secs_f64() * 1e3
+        );
         info!("Qwen3.5 GPU model loaded successfully");
         if enable_cuda_graph {
             debug!("Decode path CUDA Graph is enabled");

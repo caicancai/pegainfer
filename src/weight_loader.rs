@@ -3,9 +3,12 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
+use log::info;
+use memmap2::Mmap;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::fs;
+use std::time::Instant;
 
 use crate::tensor::*;
 
@@ -42,6 +45,29 @@ pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String,
     }
 
     Ok((shard_files, weight_map))
+}
+
+/// Memory-map shard files. Returns the mmaps; caller deserializes SafeTensors from them.
+pub fn mmap_shards(shard_paths: &[String]) -> Result<Vec<Mmap>> {
+    let t0 = Instant::now();
+    let mmaps: Vec<Mmap> = shard_paths
+        .iter()
+        .map(|p| {
+            let file = fs::File::open(p)?;
+            // SAFETY: we keep the Mmap alive for the duration of model loading,
+            // and the file is not modified concurrently.
+            unsafe { Mmap::map(&file) }
+        })
+        .collect::<std::io::Result<_>>()?;
+
+    let total_bytes: usize = mmaps.iter().map(|m| m.len()).sum();
+    info!(
+        "Memory-mapped {} shard(s) ({:.1} MB) in {:.0}ms",
+        mmaps.len(),
+        total_bytes as f64 / 1e6,
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    Ok(mmaps)
 }
 
 pub fn find_tensor<'a>(

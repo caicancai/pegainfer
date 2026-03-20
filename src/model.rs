@@ -3,8 +3,6 @@
 use anyhow::Result;
 use fastrace::local::LocalSpan;
 use log::{debug, info};
-use safetensors::SafeTensors;
-use std::fs;
 use std::time::Instant;
 
 use rand::RngExt;
@@ -158,20 +156,16 @@ impl Qwen3Model {
 
         let (shard_paths, weight_map) = load_shard_info(model_path)?;
         debug!("Loading {} safetensor shard(s)", shard_paths.len());
-        let shard_data: Vec<Vec<u8>> = shard_paths
+        let mmaps = mmap_shards(&shard_paths)?;
+        let shards: Vec<safetensors::SafeTensors> = mmaps
             .iter()
-            .map(|p| {
-                debug!("Reading shard: {}", p);
-                fs::read(p)
-            })
-            .collect::<std::io::Result<_>>()?;
-        let shards: Vec<SafeTensors> = shard_data
-            .iter()
-            .map(|d| {
-                SafeTensors::deserialize(d).map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))
+            .map(|m| {
+                safetensors::SafeTensors::deserialize(m)
+                    .map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))
             })
             .collect::<Result<_>>()?;
 
+        let t_gpu = Instant::now();
         debug!("Loading embeddings to GPU");
         let embed_tokens = load_tensor_2d(&ctx, &shards, &weight_map, "model.embed_tokens.weight")?;
         let lm_head = if config.tie_word_embeddings {
@@ -277,6 +271,10 @@ impl Qwen3Model {
             precompute_rope(&ctx, config.head_dim, 4096, config.rope_theta)?;
 
         ctx.sync()?;
+        info!(
+            "GPU transfer complete in {:.0}ms",
+            t_gpu.elapsed().as_secs_f64() * 1e3
+        );
         info!("GPU model loaded successfully");
 
         let model = Self {
